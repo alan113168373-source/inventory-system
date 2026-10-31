@@ -43,9 +43,9 @@ def serve(python, port, *, open_browser=True):
                 time.sleep(.2)
         else:
             raise RuntimeError('The server did not become ready in 30 seconds.')
-        print(f'\nOpen {url} in your browser. Keep this window open. Press Ctrl+C to stop.', flush=True)
+        print(f'\nOpen {url}/login in your browser. Keep this window open. Press Ctrl+C to stop.', flush=True)
         if open_browser:
-            webbrowser.open(url)
+            webbrowser.open(url + '/login')
         server.wait()
         if server.returncode:
             raise RuntimeError('The server stopped unexpectedly.')
