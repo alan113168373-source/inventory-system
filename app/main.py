@@ -1,11 +1,13 @@
 import io
 import os
 import sqlite3
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from app import auth
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
@@ -29,8 +31,8 @@ def db():
     ''')
     conn.execute('BEGIN IMMEDIATE')
     for table, additions in {
-        'products': [('style', "TEXT NOT NULL DEFAULT ''"), ('condition', "TEXT NOT NULL DEFAULT ''"), ('size', "TEXT NOT NULL DEFAULT ''"), ('quantity', 'INTEGER NOT NULL DEFAULT 1')],
-        'events': [('quantity', 'INTEGER NOT NULL DEFAULT 1')],
+        'products': [('style', "TEXT NOT NULL DEFAULT ''"), ('condition', "TEXT NOT NULL DEFAULT ''"), ('size', "TEXT NOT NULL DEFAULT ''"), ('quantity', 'INTEGER NOT NULL DEFAULT 1'), ('root_id', 'INTEGER'), ('parent_id', 'INTEGER')],
+        'events': [('quantity', 'INTEGER NOT NULL DEFAULT 1'), ('source_product_id', 'INTEGER')],
     }.items():
         columns = {r['name'] for r in conn.execute(f'PRAGMA table_info({table})')}
         for name, definition in additions:
@@ -50,6 +52,7 @@ def db():
             conn.execute("INSERT OR IGNORE INTO options(kind,name) VALUES('condition',?)", (name,))
         conn.execute("INSERT INTO migrations VALUES('catalog-v2')")
     conn.commit()
+    auth.schema(conn)
     try:
         yield conn
         conn.commit()
@@ -64,7 +67,8 @@ class Merchant(BaseModel):
 
 class Move(BaseModel):
     status: str
-    operator: str = Field(min_length=1, max_length=100)
+    operator: str = Field(default='', max_length=100)
+    quantity: int | None = Field(default=None, ge=1, le=1000000, strict=True)
     merchant: str = Field(default='', max_length=100)
     occurred_at: datetime
     note: str = Field(default='', max_length=1000)
@@ -151,11 +155,11 @@ def checked(m):
         raise HTTPException(422, '操作时间必须包含时区')
     return m.occurred_at.astimezone(timezone.utc).isoformat()
 
-def record(c, pid, previous, m, time, quantity=1):
+def record(c, pid, previous, m, time, quantity=1, source_product_id=None):
     merchant = m.merchant.strip() if m.status == '商家' else ''
     if merchant:
         c.execute('INSERT OR IGNORE INTO merchants(name) VALUES(?)', (merchant,))
-    c.execute('INSERT INTO events(product_id,from_status,to_status,merchant,operator,occurred_at,note,quantity) VALUES(?,?,?,?,?,?,?,?)', (pid, previous, m.status, merchant, m.operator.strip(), time, m.note.strip(),quantity))
+    c.execute('INSERT INTO events(product_id,from_status,to_status,merchant,operator,occurred_at,note,quantity,source_product_id) VALUES(?,?,?,?,?,?,?,?,?)', (pid, previous, m.status, merchant, m.operator.strip(), time, m.note.strip(),quantity,source_product_id))
     return merchant
 
 @app.get('/')
@@ -164,6 +168,8 @@ def record(c, pid, previous, m, time, quantity=1):
 @app.get('/movements')
 @app.get('/reports')
 @app.get('/settings')
+@app.get('/accounts')
+@app.get('/login')
 def index():
     return FileResponse(Path(__file__).parent / 'static/index.html')
 
@@ -187,7 +193,8 @@ def add_merchant(m: Merchant):
     return {'name': m.name.strip()}
 
 @app.post('/api/products', status_code=201)
-def create(m: Product):
+def create(m: Product, request: Request):
+    m.operator = request.state.user['username']
     time = checked(m)
     if not m.sku.strip() or not m.name.strip():
         raise HTTPException(422, '商品编号和名称不能为空')
@@ -200,28 +207,47 @@ def create(m: Product):
             value=getattr(m,kind).strip()
             if value:
                 c.execute('INSERT OR IGNORE INTO options(kind,name) VALUES(?,?)',(kind,value))
+        c.execute('UPDATE products SET root_id=? WHERE id=?',(pid,pid))
         record(c, pid, '', m, time,m.quantity)
     return {'id': pid}
 
 @app.post('/api/products/{pid}/move')
-def move(pid: int, m: Move):
+def move(pid: int, m: Move, request: Request):
+    m.operator = request.state.user['username']
     time = checked(m)
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         p = c.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
         if not p:
             raise HTTPException(404, '商品不存在')
-        latest = c.execute('SELECT MAX(occurred_at) FROM events WHERE product_id=?', (pid,)).fetchone()[0]
-        if time < latest:
+        latest = c.execute('SELECT MAX(occurred_at) FROM events WHERE product_id=? OR source_product_id=?', (pid,pid)).fetchone()[0]
+        if latest and time < latest:
             raise HTTPException(422, '操作时间不能早于该商品上一次记录')
-        merchant = record(c, pid, p['status'], m, time,p['quantity'])
-        c.execute('UPDATE products SET status=?,merchant=? WHERE id=?', (m.status, merchant, pid))
-    return {'status': 'ok'}
+        quantity = p['quantity'] if m.quantity is None else m.quantity
+        if quantity > p['quantity']:
+            raise HTTPException(409, f'当前可流转数量为{p["quantity"]}件，请刷新库存后重试')
+        merchant = m.merchant.strip() if m.status=='商家' else ''
+        same_location = m.status==p['status'] and merchant==p['merchant']
+        target_id = pid
+        if quantity < p['quantity'] and not same_location:
+            root_id=p['root_id'] or p['id']
+            root=c.execute('SELECT sku FROM products WHERE id=?',(root_id,)).fetchone()
+            while True:
+                sku=root['sku'][:80]+'-S'+secrets.token_hex(4).upper()
+                if not c.execute('SELECT 1 FROM products WHERE sku=?',(sku,)).fetchone():
+                    break
+            target_id=c.execute('INSERT INTO products(sku,name,status,merchant,created_at,style,condition,size,quantity,root_id,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)', (sku,p['name'],m.status,merchant,p['created_at'],p['style'],p['condition'],p['size'],quantity,root_id,pid)).lastrowid
+            c.execute('UPDATE products SET quantity=quantity-? WHERE id=?',(quantity,pid))
+        merchant = record(c, target_id, p['status'], m, time,quantity,pid)
+        if target_id==pid and not same_location:
+            c.execute('UPDATE products SET status=?,merchant=? WHERE id=?', (m.status, merchant, pid))
+        target=c.execute('SELECT sku FROM products WHERE id=?',(target_id,)).fetchone()
+    return {'status':'ok','quantity':quantity,'product_id':target_id,'sku':target['sku'],'split':target_id!=pid}
 
 @app.get('/api/products')
 def products(q: str = '', status: str = '', condition: str = '', style: str = '', size: str = ''):
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT * FROM products WHERE (instr(sku,?)>0 OR instr(name,?)>0 OR instr(style,?)>0) AND (?=\'\' OR status=?) AND (?=\'\' OR condition=?) AND (?=\'\' OR style=?) AND (?=\'\' OR size=?) ORDER BY id DESC', (q,q,q,status,status,condition,condition,style,style,size,size))]
+        return [dict(r) for r in c.execute('SELECT p.*,COALESCE(p.root_id,p.id) AS batch_id,(SELECT sku FROM products r WHERE r.id=COALESCE(p.root_id,p.id)) AS batch_sku FROM products p WHERE (instr(sku,?)>0 OR instr(name,?)>0 OR instr(style,?)>0) AND (?=\'\' OR status=?) AND (?=\'\' OR condition=?) AND (?=\'\' OR style=?) AND (?=\'\' OR size=?) ORDER BY id DESC', (q,q,q,status,status,condition,condition,style,style,size,size))]
 
 @app.get('/api/events')
 def events():
@@ -231,17 +257,20 @@ def events():
 @app.get('/api/products/{pid}/events')
 def history(pid: int):
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT * FROM events WHERE product_id=? ORDER BY occurred_at DESC,id DESC', (pid,))]
+        p=c.execute('SELECT COALESCE(root_id,id) AS batch_id FROM products WHERE id=?',(pid,)).fetchone()
+        if not p:
+            raise HTTPException(404,'商品不存在')
+        return [dict(r) for r in c.execute('SELECT e.*,p.sku FROM events e JOIN products p ON p.id=e.product_id WHERE COALESCE(p.root_id,p.id)=? ORDER BY e.occurred_at DESC,e.id DESC', (p['batch_id'],))]
 
 def report_data(start: datetime, end: datetime):
     if start.tzinfo is None or end.tzinfo is None or start > end:
         raise HTTPException(422, '请选择带时区的有效起止时间')
     with db() as c:
-        rows = [dict(r) for r in c.execute('SELECT e.*,p.sku,p.name FROM events e JOIN products p ON p.id=e.product_id WHERE occurred_at>=? AND occurred_at<=? ORDER BY occurred_at,id', (start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat()))]
+        rows = [dict(r) for r in c.execute('SELECT e.*,p.sku,p.name,COALESCE(p.root_id,p.id) AS batch_id FROM events e JOIN products p ON p.id=e.product_id WHERE occurred_at>=? AND occurred_at<=? ORDER BY occurred_at,id', (start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat()))]
         categories={r['name']:r['category'] for r in c.execute("SELECT * FROM options WHERE kind='status'")}
     outbound = [r for r in rows if categories.get(r['from_status'])=='warehouse' and categories.get(r['to_status']) in ['external','sold']]
     sales = [r for r in rows if categories.get(r['to_status'])=='sold' and categories.get(r['from_status'])!='sold']
-    return {'outbound_count':len(outbound), 'outbound_products':len({r['product_id'] for r in outbound}), 'sales_count':len(sales), 'sales_products':len({r['product_id'] for r in sales}), 'outbound_quantity':sum(r['quantity'] for r in outbound), 'sales_quantity':sum(r['quantity'] for r in sales), 'events':rows}
+    return {'outbound_count':len(outbound), 'outbound_products':len({r['batch_id'] for r in outbound}), 'sales_count':len(sales), 'sales_products':len({r['batch_id'] for r in sales}), 'outbound_quantity':sum(r['quantity'] for r in outbound), 'sales_quantity':sum(r['quantity'] for r in sales), 'events':rows}
 
 @app.get('/api/report')
 def report(start: datetime, end: datetime):
@@ -264,7 +293,7 @@ def export(start: datetime | None = None, end: datetime | None = None):
         raise HTTPException(422, '起止时间必须同时提供')
     wb=Workbook(); wb.remove(wb.active)
     ps=products()
-    sheet(wb,'当前库存',['编号','商品','状态','商家','登记时间（UTC）','款式','成色','尺寸','数量'],[[p[k] for k in ['sku','name','status','merchant','created_at','style','condition','size','quantity']] for p in ps])
+    sheet(wb,'当前库存',['编号','商品','状态','商家','登记时间（UTC）','款式','成色','尺寸','数量','原始批次编号'],[[p[k] for k in ['sku','name','status','merchant','created_at','style','condition','size','quantity','batch_sku']] for p in ps])
     names=[o['name'] for o in options() if o['kind']=='status']
     sheet(wb,'状态汇总',['状态','件数'],[[s,sum(p['quantity'] for p in ps if p['status']==s)] for s in names])
     if start is not None:
@@ -273,3 +302,5 @@ def export(start: datetime | None = None, end: datetime | None = None):
         sheet(wb,'期间流水',['编号','商品','原状态','新状态','商家','操作人','时间（UTC）','备注','数量'],[[e[k] for k in ['sku','name','from_status','to_status','merchant','operator','occurred_at','note','quantity']] for e in r['events']])
     stream=io.BytesIO(); wb.save(stream); stream.seek(0)
     return StreamingResponse(stream,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename=inventory.xlsx'})
+
+auth.install(app,db)

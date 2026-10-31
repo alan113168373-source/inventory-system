@@ -5,12 +5,14 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 import pytest
 from app import main
+from conftest import authenticate
 
 
 @pytest.fixture
-def client(tmp_path,monkeypatch):
+def client(tmp_path,monkeypatch,request):
     monkeypatch.setattr(main,'DB_PATH',tmp_path/'inventory.db')
-    return TestClient(main.app)
+    client=TestClient(main.app)
+    return client if request.node.name=='test_legacy_database_migration' else authenticate(client)
 
 
 def product(**changes):
@@ -37,7 +39,7 @@ def test_fields_filters_custom_status_and_quantity_report(client):
     assert report['outbound_count']==1 and report['sales_products']==1
     assert all(e['quantity']==8 for e in client.get('/api/events').json())
     wb=load_workbook(BytesIO(client.get('/api/export',params=params).content))
-    assert [c.value for c in wb['当前库存'][2]][5:]==['托特款','九成新','中号',8]
+    assert [c.value for c in wb['当前库存'][2]][5:9]==['托特款','九成新','中号',8]
     assert dict(wb['状态汇总'].iter_rows(min_row=2,values_only=True))['已售']==8
     assert wb['期间流水']['I2'].value==8
 
@@ -73,6 +75,7 @@ def test_legacy_database_migration(client):
         INSERT INTO products VALUES(1,'OLD-1','旧商品','仓库','','2025-01-01T00:00:00+00:00');
         INSERT INTO events VALUES(1,1,'','仓库','','旧操作员','2025-01-01T00:00:00+00:00','旧备注');
         ''')
+    authenticate(client)
     for _ in range(2):
         p=client.get('/api/products').json()[0]
         assert p['sku']=='OLD-1' and p['quantity']==1 and p['condition']==''

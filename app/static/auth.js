@@ -1,0 +1,29 @@
+window.currentUser=null;
+window.csrfToken='';
+const roleNames={admin:'管理员',employee:'员工',viewer:'只读人员'};
+window.showLogin=()=>{
+ window.currentUser=null;window.csrfToken='';
+ document.body.classList.remove('logged-in');$('#login-page').hidden=false;$('#account-bar').hidden=true;
+ document.querySelectorAll('[data-page]').forEach(el=>el.hidden=true);
+ document.querySelectorAll('dialog[open]').forEach(el=>el.close());
+ document.querySelectorAll('#inventory,#all-events,#report-rows,#summary,#overview,#options-table,#history,#user-list,#merchants,#style-options,#condition-options,#size-options').forEach(el=>el.replaceChildren());
+ for(const id of ['#create','#move','#new-user','#password-form','#option-form'])$(id).reset();
+ document.querySelectorAll('input[type=password]').forEach(el=>el.value='');
+ for(const id of ['#search','#filter','#condition-filter','#style-filter','#size-filter'])$(id).value='';
+ $('#create').elements.occurred_at.value=localTime();
+ allProducts=[];options=[];merchants=[];selected=null;page=1;
+ document.querySelectorAll('[name=operator]').forEach(el=>el.value='');
+ $('#message').hidden=true;document.title='员工登录 · 库存工作台';
+};
+window.applyAccount=()=>{const user=window.currentUser;if(!user)return;const viewer=user.role==='viewer';document.querySelectorAll('[name=operator]').forEach(el=>{el.value=user.username;el.readOnly=true});document.querySelectorAll('[data-admin-only]').forEach(el=>el.hidden=user.role!=='admin');document.querySelectorAll('#create input,#create select,#create textarea,#create button,#move input,#move select,#move textarea,#move button,#export,#period-export,#settings-add,[data-add-option]').forEach(el=>el.disabled=viewer);document.querySelectorAll('#inventory button').forEach(el=>{if(el.textContent==='流转')el.disabled=viewer});document.querySelectorAll('#options-table button').forEach(el=>el.disabled=viewer)};
+async function enter(user){window.currentUser=user;window.csrfToken=user.csrf;document.body.classList.add('logged-in');$('#login-page').hidden=true;$('#account-bar').hidden=false;$('#account-name').textContent=`${user.username} · ${roleNames[user.role]}`;if(location.pathname==='/login')history.replaceState({},'','/inventory');window.applyAccount();await loadOptions();await showPage()}
+window.initializeAuth=async()=>{try{const r=await fetch('/api/auth/me');if(r.status===401){window.showLogin();return}if(!r.ok)throw Error('连接失败，请检查服务启动窗口');await enter(await r.json())}catch(err){window.showLogin();$('#login-error').textContent=err.message}};
+$('#login-form').onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector('button');b.disabled=true;$('#login-error').textContent='';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});const result=await r.json();if(!r.ok)throw Error(typeof result.detail==='string'?result.detail:'账号格式不正确');e.target.reset();await enter(result)}catch(err){$('#login-error').textContent=err.message}finally{b.disabled=false}};
+$('#logout').onclick=run(async()=>{await api('/api/auth/logout','POST');window.showLogin()});
+$('#change-password').onclick=()=>{$('#password-form').reset();$('#password-error').textContent='';$('#password-dialog').showModal()};
+$('#password-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.password!==body.confirm){$('#password-error').textContent='两次输入的新密码不一致';return}const b=e.target.querySelector('button');b.disabled=true;try{await api('/api/auth/password','POST',body);window.showLogin();$('#login-error').textContent='密码已修改，请重新登录'}catch(err){$('#password-error').textContent=err.message}finally{b.disabled=false}};
+window.loadUsers=async()=>{const users=await api('/api/users');$('#user-list').replaceChildren();for(const user of users){const row=element('div',undefined,'user-row');const name=element('strong',user.username);const role=element('select');role.setAttribute('aria-label',user.username+'角色');for(const [key,title] of Object.entries(roleNames)){const o=element('option',title);o.value=key;role.append(o)}role.value=user.role;const active=element('input');active.type='checkbox';active.checked=!!user.active;const label=element('label','启用');label.className='active-label';label.append(active);const password=element('input');password.type='password';password.placeholder='重置密码（留空不改）';password.autocomplete='new-password';password.maxLength=128;password.setAttribute('aria-label',user.username+'重置密码');const save=element('button','保存','secondary');save.onclick=run(async()=>{await api(`/api/users/${user.id}`,'PUT',{role:role.value,active:active.checked,password:password.value||null});if(user.id===window.currentUser.id){window.showLogin();$('#login-error').textContent='账号已更新，请重新登录';return}await window.loadUsers();message('账号已更新，原登录已撤销')});row.append(name,role,label,password,save);$('#user-list').append(row)}};
+$('#new-user').onsubmit=run(async e=>{const b=e.target.querySelector('button');b.disabled=true;try{await api('/api/users','POST',Object.fromEntries(new FormData(e.target)));e.target.reset();await window.loadUsers();message('员工账号已创建')}finally{b.disabled=false}});
+document.querySelectorAll('#create,#move').forEach(form=>form.addEventListener('reset',()=>setTimeout(()=>window.applyAccount(),0)));
+new MutationObserver(()=>window.applyAccount()).observe($('#inventory'),{childList:true});
+new MutationObserver(()=>window.applyAccount()).observe($('#options-table'),{childList:true});

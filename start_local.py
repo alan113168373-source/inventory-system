@@ -34,7 +34,7 @@ def serve(python, port, *, open_browser=True):
             if server.poll() is not None:
                 raise RuntimeError('The server stopped. See the error above.')
             try:
-                for path in ['/api/health', '/static/style.css', '/static/app.js']:
+                for path in ['/api/health', '/static/style.css', '/static/app.js', '/static/auth.css', '/static/auth.js']:
                     with opener.open(url + path, timeout=1) as response:
                         if response.status != 200:
                             raise RuntimeError('Application files could not be loaded.')
@@ -70,6 +70,7 @@ def main():
     if probe.returncode:
         print('Installing dependencies (Internet connection required)...', flush=True)
         subprocess.run([str(python), '-m', 'pip', 'install', '-r', str(ROOT / 'requirements.lock')], cwd=ROOT, check=True)
+    subprocess.run([str(python), '-m', 'app.manage_admin', '--if-needed'], cwd=ROOT, check=True)
     serve(python, choose_port())
 
 

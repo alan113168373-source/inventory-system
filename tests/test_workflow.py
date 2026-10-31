@@ -4,11 +4,12 @@ import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from app import main
+from conftest import authenticate
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DB_PATH', tmp_path / 'test.db')
-    return TestClient(main.app)
+    return authenticate(TestClient(main.app))
 
 def data(status='仓库', **kwargs):
     return dict(status=status, operator='张三', merchant='', occurred_at='2026-01-01T10:00:00+08:00', **kwargs)
@@ -49,6 +50,7 @@ def test_validation_and_persistence(client):
     assert wb['当前库存']['A2'].data_type=='s'
     assert wb['当前库存']['A2'].value=="'=1+1"
     with TestClient(main.app) as other:
+        other.cookies.update(client.cookies)
         assert len(other.get('/api/products').json())==1
     assert client.get('/').status_code==200
     assert client.get('/api/health').json()=={'status':'ok'}
