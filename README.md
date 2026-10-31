@@ -70,6 +70,14 @@ macOS / Linux 也可以执行 `python3 start_local.py` 自动安装、启动和�
 
 ## 验证
 
+### 导入虚拟测试库存
+
+Windows 安装依赖后双击 `seed_demo.bat`，其他系统在项目目录执行 `.venv/bin/python -m scripts.seed_demo`，然后打开或刷新总库存。
+
+生成100件拉夫劳伦Polo衬衫，每件独立编号（`DEMO-RL-POLO-001`～`100`）、数量1。全新/有使用痕迹各50件，L/M各50件，每种成色与尺寸组合25件；固定随机分配到鉴定仓50件、Aloha商家50件。自动新增“鉴定仓”状态和“Aloha”商家，每件有入库、流转两条虚拟流水，可用于期间统计测试。
+
+所有流水标注“虚拟测试数据”，时间在生成日前一周内。重复运行不会重复添加或覆盖已有商品；正式使用前请换用不含测试数据的数据库。与已有库存混合使用前请先备份。
+
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/python -m pip check
